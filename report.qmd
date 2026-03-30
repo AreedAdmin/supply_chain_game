@@ -1,0 +1,624 @@
+---
+title: "Supply Chain Game – Analytics Report"
+author: "LSC Analytics Team"
+date: today
+format:
+  html:
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    fig-width: 10
+    fig-height: 5
+jupyter: python3
+execute:
+  warning: false
+  message: false
+---
+
+```{python}
+#| label: setup
+#| echo: false
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+sys.path.insert(0, str(Path(".").resolve()))
+import config as cfg
+from optimizer import (
+    FACTORY_BUILD_TIME_DAYS,
+    FACTORY_CAPACITY_COST_PER_DRUM,
+    FACTORY_FIXED_COST,
+    PRODUCTION_COST_PER_UNIT,
+    _time_decay_weights,
+    analyse_investments,
+    forecast_demand,
+    load_latest_run,
+    optimize_inventory,
+)
+
+gd = load_latest_run()
+game_day = gd.get("game_day", "?")
+demand_df = gd["demand"]
+lost_df = gd["lost_demand"]
+cash_df = gd.get("cash_balance")
+regions = [c for c in demand_df.columns if c != "day"]
+
+COLORS = {
+    "Calopeia": "#2563eb",
+    "Sorange": "#f59e0b",
+    "Tyran": "#10b981",
+    "Entworpe": "#ef4444",
+    "Fardo": "#8b5cf6",
+}
+```
+
+## Executive Summary
+
+```{python}
+#| label: exec-summary
+#| echo: false
+
+cash_val = "N/A"
+if cash_df is not None and "cash" in cash_df.columns:
+    cash_val = f"${cash_df['cash'].iloc[-1] * 1_000:,.0f}"
+
+total_demand = demand_df[regions].sum().sum()
+total_lost = lost_df[regions].sum().sum()
+overall_service = (1 - total_lost / total_demand) * 100
+
+from IPython.display import Markdown
+
+summary = f"""
+| Metric | Value |
+|:-------|------:|
+| **Game Day** | {game_day} |
+| **Cash Balance** | {cash_val} |
+| **Revenue per Drum** | ${cfg.REVENUE_PER_DRUM:,.0f} |
+| **Total Demand (all time)** | {total_demand:,.0f} drums |
+| **Total Lost Demand** | {total_lost:,.0f} drums |
+| **Overall Service Rate** | {overall_service:.1f}% |
+| **Cumulative Lost Revenue** | ${total_lost * cfg.REVENUE_PER_DRUM:,.0f} |
+"""
+Markdown(summary)
+```
+
+---
+
+## 1. Demand Analysis
+
+### 1.1 Demand Over Time (All Regions)
+
+```{python}
+#| label: fig-demand-all
+#| fig-cap: "Daily demand by region over the full game history"
+
+fig = go.Figure()
+for r in regions:
+    fig.add_trace(go.Scatter(
+        x=demand_df["day"], y=demand_df[r],
+        mode="lines", name=r,
+        line=dict(color=COLORS.get(r), width=1.5),
+        opacity=0.8,
+    ))
+
+fig.update_layout(
+    xaxis_title="Game Day",
+    yaxis_title="Demand (drums)",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    hovermode="x unified",
+    template="plotly_white",
+    height=400,
+)
+fig.show()
+```
+
+### 1.2 Recent Demand (Last 90 Days)
+
+```{python}
+#| label: fig-demand-recent
+#| fig-cap: "Last 90 days of demand — note Entworpe's 250-unit bulk orders"
+
+recent = demand_df.tail(90)
+fig = go.Figure()
+for r in regions:
+    fig.add_trace(go.Bar(
+        x=recent["day"], y=recent[r],
+        name=r, marker_color=COLORS.get(r),
+        opacity=0.85,
+    ))
+
+fig.update_layout(
+    barmode="stack",
+    xaxis_title="Game Day",
+    yaxis_title="Demand (drums)",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    template="plotly_white",
+    height=400,
+)
+fig.show()
+```
+
+### 1.3 Demand Forecast Summary
+
+```{python}
+#| label: tbl-forecast
+#| tbl-cap: "Time-decayed demand forecast with regime-change detection"
+
+forecasts = forecast_demand(demand_df)
+fc_data = []
+for f in forecasts:
+    fc_data.append({
+        "Region": f.region,
+        "Avg (all)": f.mean_all,
+        "Avg (90d, weighted)": f.mean_recent,
+        "EWMA": f.ewma_forecast,
+        "Trend": f.trend,
+        "Active % (all)": f"{f.nonzero_pct_all:.1f}%",
+        "Active % (90d)": f"{f.nonzero_pct_recent:.1f}%",
+        "Avg Order Size": f.avg_order_size,
+        "Peak": f.peak_demand,
+    })
+
+fc_table = pd.DataFrame(fc_data)
+Markdown(fc_table.to_markdown(index=False))
+```
+
+### 1.4 EWMA Trend by Region
+
+```{python}
+#| label: fig-ewma
+#| fig-cap: "Exponentially Weighted Moving Average (span=30) for each region"
+
+fig = make_subplots(
+    rows=3, cols=2,
+    subplot_titles=regions + [""],
+    vertical_spacing=0.1,
+)
+
+positions = [(1,1), (1,2), (2,1), (2,2), (3,1)]
+for i, r in enumerate(regions):
+    row, col = positions[i]
+    series = demand_df[r].astype(float)
+    ewma = series.ewm(span=30).mean()
+    fig.add_trace(go.Scatter(
+        x=demand_df["day"], y=series,
+        mode="lines", name=f"{r} demand",
+        line=dict(color=COLORS.get(r), width=0.8),
+        opacity=0.4, showlegend=False,
+    ), row=row, col=col)
+    fig.add_trace(go.Scatter(
+        x=demand_df["day"], y=ewma,
+        mode="lines", name=f"{r} EWMA",
+        line=dict(color=COLORS.get(r), width=2.5),
+        showlegend=False,
+    ), row=row, col=col)
+
+fig.update_layout(
+    height=700, template="plotly_white",
+    title_text="Demand vs EWMA(30) per Region",
+)
+fig.show()
+```
+
+---
+
+## 2. Lost Demand & Service Rates
+
+### 2.1 Cumulative Lost Demand
+
+```{python}
+#| label: fig-lost-cumulative
+#| fig-cap: "Cumulative lost demand by region — Entworpe and Tyran are the largest sources of lost revenue"
+
+fig = go.Figure()
+for r in regions:
+    cumulative = lost_df[r].cumsum()
+    fig.add_trace(go.Scatter(
+        x=lost_df["day"], y=cumulative,
+        mode="lines", name=r,
+        line=dict(color=COLORS.get(r), width=2),
+        fill="tonexty" if r != regions[0] else None,
+    ))
+
+fig.update_layout(
+    xaxis_title="Game Day",
+    yaxis_title="Cumulative Lost Demand (drums)",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    template="plotly_white",
+    height=400,
+)
+fig.show()
+```
+
+### 2.2 Service Rate by Region
+
+```{python}
+#| label: fig-service-rate
+#| fig-cap: "Lifetime service rate — only Calopeia is adequately served"
+
+service_data = []
+for r in regions:
+    total_d = demand_df[r].sum()
+    total_l = lost_df[r].sum()
+    sr = (1 - total_l / total_d) * 100 if total_d > 0 else 100
+    service_data.append({"Region": r, "Service Rate (%)": round(sr, 1)})
+
+sr_df = pd.DataFrame(service_data)
+fig = px.bar(
+    sr_df, x="Region", y="Service Rate (%)",
+    color="Region",
+    color_discrete_map=COLORS,
+    text="Service Rate (%)",
+)
+fig.add_hline(y=95, line_dash="dash", line_color="red",
+              annotation_text="95% target")
+fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+fig.update_layout(
+    template="plotly_white", height=400,
+    yaxis_range=[0, 105], showlegend=False,
+)
+fig.show()
+```
+
+### 2.3 Lost Revenue Analysis (Time-Decayed)
+
+```{python}
+#| label: tbl-lost-revenue
+#| tbl-cap: "Lost revenue by region — time-decayed weighting emphasises recent patterns"
+
+investments = analyse_investments(gd)
+inv_data = []
+for inv in investments:
+    inv_data.append({
+        "Region": inv.region,
+        "Total Demand": f"{inv.total_demand:,.0f}",
+        "Total Lost": f"{inv.total_lost:,.0f}",
+        "Service %": f"{inv.service_rate_pct:.1f}%",
+        "Lost Revenue": f"${inv.lost_revenue:,.0f}",
+        "Daily (weighted)": f"${inv.daily_lost_revenue:,.0f}",
+        "Annual Est.": f"${inv.annual_lost_revenue_est:,.0f}",
+    })
+
+Markdown(pd.DataFrame(inv_data).to_markdown(index=False))
+```
+
+---
+
+## 3. Cash Balance
+
+```{python}
+#| label: fig-cash
+#| fig-cap: "Cash balance over time (values in $000s on source, displayed in $)"
+
+if cash_df is not None and "cash" in cash_df.columns:
+    cash_plot = cash_df.copy()
+    cash_plot["cash_dollars"] = cash_plot["cash"] * 1_000
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=cash_plot["day"], y=cash_plot["cash_dollars"],
+        mode="lines",
+        line=dict(color="#2563eb", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(37,99,235,0.1)",
+    ))
+    fig.update_layout(
+        xaxis_title="Game Day",
+        yaxis_title="Cash Balance ($)",
+        yaxis_tickprefix="$",
+        yaxis_tickformat=",",
+        template="plotly_white",
+        height=400,
+    )
+    fig.show()
+else:
+    Markdown("*Cash balance data not available.*")
+```
+
+---
+
+## 4. Warehouse Operations
+
+### 4.1 Inventory Level (Calopeia Warehouse)
+
+```{python}
+#| label: fig-inventory
+#| fig-cap: "Calopeia warehouse inventory level over time"
+
+inv_data_dict = gd.get("inventory", {})
+if inv_data_dict:
+    inv_df = list(inv_data_dict.values())[0]
+    inv_cols = [c for c in inv_df.columns if c != "day"]
+
+    fig = go.Figure()
+    for col in inv_cols:
+        fig.add_trace(go.Scatter(
+            x=inv_df["day"], y=inv_df[col],
+            mode="lines", name=col,
+            line=dict(width=2),
+        ))
+
+    fig.update_layout(
+        xaxis_title="Game Day",
+        yaxis_title="Inventory (drums)",
+        template="plotly_white",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    fig.show()
+else:
+    Markdown("*Inventory data not available — run the pipeline to collect.*")
+```
+
+### 4.2 Current Warehouse Parameters
+
+```{python}
+#| label: tbl-wh-params
+#| tbl-cap: "Current Calopeia warehouse configuration"
+
+wh = gd.get("warehouse_params", {})
+if wh:
+    rows = []
+    for entry in wh.get("inbound", []):
+        rows.append({
+            "Direction": "Inbound",
+            "Factory": entry.get("factory", ""),
+            "Ship Method": entry.get("shipping_method", ""),
+            "Order Point": entry.get("order_point", ""),
+            "Quantity": entry.get("quantity", ""),
+            "Priority": entry.get("priority", ""),
+        })
+    for entry in wh.get("outbound", []):
+        rows.append({
+            "Direction": "Outbound",
+            "Factory": entry.get("destination", ""),
+            "Ship Method": "",
+            "Order Point": "",
+            "Quantity": "",
+            "Priority": f"Serve={'Yes' if entry.get('serve') else 'No'}, FC={entry.get('fulfillment_cost','')}",
+        })
+    Markdown(pd.DataFrame(rows).to_markdown(index=False))
+else:
+    Markdown("*Warehouse parameters not available.*")
+```
+
+### 4.3 (s, Q) Optimization Recommendation
+
+```{python}
+#| label: tbl-sq-rec
+#| tbl-cap: "Recommended warehouse reorder parameters"
+
+recs = optimize_inventory(gd)
+if recs:
+    r = recs[0]
+    rec_tbl = f"""
+| Parameter | Current | Recommended |
+|:----------|--------:|------------:|
+| **Order Point (s)** | {r.current_s:,} | {r.recommended_s:,} |
+| **Order Quantity (Q)** | {r.current_Q:,} | {r.recommended_Q:,} |
+| **Shipping Method** | {r.shipping_method} | {r.shipping_method} (keep) |
+| **Avg Cost/Day** | ${r.current_cost:,.0f} | ${r.recommended_cost:,.0f} |
+| **Savings/Day** | | ${r.savings_per_day:,.0f} |
+| **Serving** | | {', '.join(r.served_regions)} |
+"""
+    Markdown(rec_tbl)
+else:
+    Markdown("*No warehouse data available for optimisation.*")
+```
+
+---
+
+## 5. Factory Operations
+
+### 5.1 Calopeia Factory WIP
+
+```{python}
+#| label: fig-wip
+#| fig-cap: "Work-in-progress at the Calopeia factory"
+
+wip_data = gd.get("wip", {})
+if wip_data:
+    wip_df = list(wip_data.values())[0]
+    wip_cols = [c for c in wip_df.columns if c != "day"]
+
+    fig = go.Figure()
+    for col in wip_cols:
+        fig.add_trace(go.Scatter(
+            x=wip_df["day"], y=wip_df[col],
+            mode="lines", name=col,
+            line=dict(width=2, color="#2563eb"),
+        ))
+
+    fig.update_layout(
+        xaxis_title="Game Day",
+        yaxis_title="WIP (drums)",
+        template="plotly_white",
+        height=400,
+    )
+    fig.show()
+else:
+    Markdown("*WIP data not available — run the pipeline to collect.*")
+```
+
+---
+
+## 6. Investment Analysis
+
+### 6.1 Recent Demand Profile
+
+```{python}
+#| label: fig-recent-demand-profile
+#| fig-cap: "Time-decayed daily demand rate by region (recent 90-day window)"
+
+inv_results = analyse_investments(gd)
+profile_data = [
+    {"Region": inv.region, "Daily Demand (weighted)": inv.recent_daily_demand,
+     "Active %": inv.recent_active_pct, "Avg Order": inv.avg_order_size}
+    for inv in inv_results if inv.recent_daily_demand > 0.1
+]
+profile_df = pd.DataFrame(profile_data)
+
+fig = px.bar(
+    profile_df, x="Region", y="Daily Demand (weighted)",
+    color="Region", color_discrete_map=COLORS,
+    text="Daily Demand (weighted)",
+)
+fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+fig.update_layout(
+    template="plotly_white", height=400,
+    showlegend=False, yaxis_title="Drums/Day (time-decayed avg)",
+)
+fig.show()
+```
+
+### 6.2 Annual Lost Revenue Opportunity
+
+```{python}
+#| label: fig-annual-lost-rev
+#| fig-cap: "Estimated annual lost revenue by region based on recent demand trends"
+
+lost_rev_data = [
+    {"Region": inv.region, "Annual Lost Revenue ($)": inv.annual_lost_revenue_est}
+    for inv in inv_results
+]
+lr_df = pd.DataFrame(lost_rev_data)
+
+fig = px.bar(
+    lr_df, x="Region", y="Annual Lost Revenue ($)",
+    color="Region", color_discrete_map=COLORS,
+    text="Annual Lost Revenue ($)",
+)
+fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside")
+fig.update_layout(
+    template="plotly_white", height=400,
+    showlegend=False, yaxis_tickprefix="$", yaxis_tickformat=",",
+)
+fig.show()
+```
+
+### 6.3 Factory Investment Recommendations
+
+```{python}
+#| label: tbl-factory-rec
+#| tbl-cap: "Factory investment analysis for each region"
+
+factory_rows = []
+for inv in inv_results:
+    if inv.recommended_capacity == 0:
+        continue
+    payback_str = f"{inv.payback_days:.0f} days" if inv.payback_days < 9999 else "N/A"
+    factory_rows.append({
+        "Region": inv.region,
+        "Capacity (d/d)": inv.recommended_capacity,
+        "Build Cost": f"${inv.factory_build_cost:,.0f}",
+        "Payback": payback_str,
+        "Daily Demand": f"{inv.recent_daily_demand:.1f}",
+        "Avg Order": f"{inv.avg_order_size:.0f}",
+        "Service Rate": f"{inv.service_rate_pct:.1f}%",
+    })
+
+Markdown(pd.DataFrame(factory_rows).to_markdown(index=False))
+```
+
+### 6.4 Entworpe Deep Dive
+
+```{python}
+#| label: fig-entworpe-detail
+#| fig-cap: "Entworpe demand and lost demand — regime change from sporadic to regular bulk orders"
+
+fig = make_subplots(
+    rows=2, cols=1,
+    subplot_titles=["Entworpe Demand", "Entworpe Lost Demand"],
+    shared_xaxes=True,
+    vertical_spacing=0.12,
+)
+
+fig.add_trace(go.Bar(
+    x=demand_df["day"], y=demand_df["Entworpe"],
+    marker_color=COLORS["Entworpe"], opacity=0.8, name="Demand",
+), row=1, col=1)
+
+fig.add_trace(go.Bar(
+    x=lost_df["day"], y=lost_df["Entworpe"],
+    marker_color="#991b1b", opacity=0.8, name="Lost Demand",
+), row=2, col=1)
+
+fig.update_layout(
+    height=500, template="plotly_white",
+    showlegend=False,
+    xaxis2_title="Game Day",
+)
+fig.update_yaxes(title_text="Drums", row=1, col=1)
+fig.update_yaxes(title_text="Drums", row=2, col=1)
+fig.show()
+```
+
+::: {.callout-important}
+## Regime Change Detected — Entworpe
+
+Entworpe's demand pattern has fundamentally shifted. Historically active on only 1.1% of days, the region now places **250-unit bulk orders** on 7.8% of recent days. This makes it the **highest-revenue opportunity** at an estimated **$9.3M/year** in lost revenue.
+
+**Action taken:** New factory opened with **31 drums/day** capacity ($2.05M investment, ~349-day payback).
+:::
+
+---
+
+## 7. Shipments
+
+```{python}
+#| label: fig-shipments
+#| fig-cap: "Outbound shipments from the Calopeia warehouse"
+
+ship_data = gd.get("shipments", {})
+if ship_data:
+    ship_df = list(ship_data.values())[0]
+    ship_cols = [c for c in ship_df.columns if c != "day"]
+
+    fig = go.Figure()
+    for col in ship_cols:
+        fig.add_trace(go.Scatter(
+            x=ship_df["day"], y=ship_df[col],
+            mode="lines", name=col,
+            line=dict(width=1.5, color=COLORS.get(col)),
+        ))
+
+    fig.update_layout(
+        xaxis_title="Game Day",
+        yaxis_title="Shipments (drums)",
+        template="plotly_white",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    fig.show()
+else:
+    Markdown("*Shipment data not available — run the pipeline to collect.*")
+```
+
+---
+
+## 8. Decision Log
+
+| Date | Day | Decision | Rationale |
+|:-----|----:|:---------|:----------|
+| 30 Mar 2026 | 757 | Enabled fulfillment from Calopeia to all 5 regions | Reduce lost demand across all regions |
+| 30 Mar 2026 | 757 | Opened Entworpe factory (31 d/d, $2.05M) | Regime change — bulk 250-unit orders, $9.3M/yr lost revenue |
+
+---
+
+## 9. Next Steps
+
+1. **Build Entworpe warehouse** — buffer ~300 units for bulk-order peaks once factory completes (Day ~847)
+2. **Monitor Sorange/Tyran** — both show increasing activity (93% and 92% active days); consider local factories if demand sustains
+3. **Fardo caution** — high fulfillment cost ($400/drum) makes payback 2,054 days; deprioritise unless costs drop
+4. **Re-optimise Calopeia (s, Q)** after Entworpe factory is online — removing Entworpe demand from Calopeia warehouse will change optimal parameters
+5. **Re-run pipeline daily** via `python pipeline.py` to track trends
