@@ -35,8 +35,23 @@ We set up fulfillment from our Calopeia warehouse to all other regions to make u
 
 **Cash position after Entworpe + Tyran:** ~$6.6M − $2.05M − $1.55M = **~$3.0M remaining**.
 
+### 4. New Factory in Sorange (3:15pm)
+
+**Decision:** Opened a new factory in Sorange with capacity **21 drums/day**.
+
+**Rationale (based on fresh data pull at Day 770):**
+- Sorange demand is **increasing sharply**: demand nearly doubled across 30-day thirds (277 → 381 → 541 drums), with 100% of the last 30 days active.
+- Time-decayed average demand = 15.6 units/day (90d), rising to 18.4 (30d). With 1.3x buffer → 21 drums/day capacity.
+- Service rate is only **24.1%** — losing 3 out of 4 orders.
+- Annual lost revenue estimated at **$4.5M/year**.
+- Build cost: $500K fixed + 21 × $50K equipment = **$1.55M**. Estimated payback: ~397 days.
+- Net revenue per drum after production ($1,000) and fulfillment ($200) costs: $250/drum.
+- The factory will take 90 days to complete construction.
+
+**Cash position:** $3.77M at Day 770 — tight after three factory investments but still positive. Revenue from Calopeia operations continues to generate cash flow while factories are under construction.
+
 **Next steps to consider:**
-- Build warehouses in Entworpe and Tyran to buffer stock once factories complete (~Day 847).
-- Sorange is the next best factory investment (19 d/d, $1.45M, 416-day payback, $6.3M/yr lost revenue). Could build now with remaining cash.
+- Build warehouses in Entworpe, Tyran, and Sorange to buffer stock once their factories complete (~Day 847–860).
 - Avoid Fardo for now — $400/drum fulfillment cost results in only $50/drum net margin and a 2,054-day payback.
-- Re-run the optimization pipeline after factories come online to reassess warehouse (s,Q) parameters.
+- Re-run the optimization pipeline after factories come online to reassess Calopeia warehouse (s,Q) parameters — demand served by Calopeia will drop significantly once three local factories are operational.
+- Monitor cash balance closely; three simultaneous factory builds with no immediate revenue return.
